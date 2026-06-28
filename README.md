@@ -1,3 +1,5 @@
+小红书图片下载与复制助手 / RedNote Image Copy Helper
+
 [English](./README.md) | [中文](./README.zh-CN.md)
 
 A Tampermonkey userscript for RedNote / Xiaohongshu / 小红书 that helps with note text copy, image copy workflows, and note-scoped image download directly in the browser.
