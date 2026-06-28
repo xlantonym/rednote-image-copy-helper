@@ -1,4 +1,4 @@
-# RedNote Image Copy Helper
+# RedNote Image Copy Helper小红书中文图文复制插件
 
 A Tampermonkey userscript that helps users copy note text and download images from RedNote/Xiaohongshu pages more efficiently.
 
