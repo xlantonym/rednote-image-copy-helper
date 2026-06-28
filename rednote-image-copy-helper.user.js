@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RedNote Image Copy Helper
 // @namespace    https://github.com/xl-antonym/rednote-image-copy-helper
-// @version      0.1.1
+// @version      0.1.7
 // @description  Copy note text and download images from RedNote/Xiaohongshu pages.
 // @author       Xin Li
 // @match        https://www.xiaohongshu.com/*
@@ -31,6 +31,34 @@
   const DEBUG = false;
   const MIN_WIDTH = 180;
   const MIN_HEIGHT = 180;
+  const DETAIL_ROOT_SELECTOR = [
+    'article',
+    'main',
+    'section',
+    '[role="main"]',
+    '[class*="detail"]',
+    '[class*="note"]',
+    '[class*="media"]',
+    '[class*="content"]',
+    '[class*="container"]',
+  ].join(',');
+  const BAD_SECTION_RE = /avatar|comment|emoji|footer|header|icon|logo|nav|recommend|related|search|side-?bar|suggest|toolbar/i;
+  const BAD_TEXT_SECTION_RE = /comment|footer|header|nav|recommend|related|search|side-?bar|suggest|toolbar/i;
+  const NOTE_TEXT_RE = /content|desc|description|detail|note|text|title/i;
+  const NOTE_MEDIA_RE = /image|media|photo|picture|slider|swiper|video/i;
+  const UI_CONTROL_RE = /action|btn|button|collect|comment|favorite|follow|interact|like|operation|share|toolbar/i;
+  const SHORT_UI_TEXT_RE = /^(关注|已关注|赞|点赞|收藏|评论|分享|follow|following|like|liked|favorite|favourite|comment|share)$/i;
+  const ACTIVE_ROOT_SELECTORS = [
+    '.note-detail-mask',
+    '.note-detail-container',
+    '.note-detail',
+    '[class*="note-detail"]',
+    '.note-container',
+    '[class*="note-container"]',
+    '[class*="media-container"]',
+    '[class*="interaction-container"]',
+    '[class*="note-content"]',
+  ];
   const RAIL_SLOT_CONFIG = {
     right: 24,
     baseBottom: 178,
@@ -130,6 +158,10 @@
   let devMode = loadDevMode();
   let detectedTheme = 'light';
   let miniPositionTimer = null;
+  let activeRootInfoCache = null;
+  let activeRootInfoCacheTime = 0;
+  let detailSignalsCache = new WeakMap();
+  let detailSignalsCacheTime = 0;
 
   function t(key, vars = {}) {
     const table = I18N[uiLang] || I18N.zh;
@@ -335,6 +367,7 @@
 
   function hasDetailLayerIndicator(el) {
     if (!el || !(el instanceof Element)) return false;
+    if (isNonRootUiControl(el)) return false;
     const text = `${classText(el)} ${classText(el.parentElement)} ${el.id || ''}`.toLowerCase();
     if (/note-detail|detail-mask|detail-container/.test(text)) return true;
 
@@ -352,21 +385,353 @@
     );
   }
 
+  function getElementLabel(el) {
+    if (!el || !(el instanceof Element)) return '';
+    return [
+      el.id || '',
+      classText(el),
+      el.getAttribute('role') || '',
+      el.getAttribute('aria-label') || '',
+    ].join(' ').toLowerCase();
+  }
+
+  function isBroadPageContainer(el) {
+    return (
+      el === document ||
+      el === document.body ||
+      el === document.documentElement ||
+      el?.tagName?.toLowerCase() === 'main' ||
+      el?.id === 'app'
+    );
+  }
+
+  function getShortElementText(el) {
+    if (!el || !(el instanceof Element)) return '';
+    const text = normalizeText(el.innerText || el.textContent);
+    return text.length <= 40 ? text : '';
+  }
+
+  // Share-style pages may render #noteContainer as a text-first root.
+  // 分享页中 #noteContainer 可能主要承载标题、作者和正文文本。
+  function getMeaningfulTextSummary(root) {
+    if (!root || !(root instanceof Element)) {
+      return { length: 0, preview: '', hasMeaningfulText: false };
+    }
+
+    const raw = normalizeText(root.innerText || root.textContent, true);
+    if (!raw) return { length: 0, preview: '', hasMeaningfulText: false };
+
+    const text = raw
+      .split('\n')
+      .map(line => normalizeText(line))
+      .filter(line => {
+        if (!line) return false;
+        if (SHORT_UI_TEXT_RE.test(line)) return false;
+        if (/^(展开|收起|更多|查看|打开|复制|下载|follow|like|share|comment)$/i.test(line)) return false;
+        return true;
+      })
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    return {
+      length: text.length,
+      preview: truncateText(text, 220),
+      hasMeaningfulText: text.length >= 40,
+    };
+  }
+
+  function isNonRootUiControl(el) {
+    if (!el || !(el instanceof Element)) return '';
+
+    const label = getElementLabel(el);
+    const tag = el.tagName.toLowerCase();
+    const role = String(el.getAttribute('role') || '').toLowerCase();
+    const text = getShortElementText(el);
+    const rect = el.getBoundingClientRect();
+    const area = rect.width * rect.height;
+    const viewportArea = window.innerWidth * window.innerHeight;
+    const isSmall = rect.width < 320 || rect.height < 160 || area < viewportArea * 0.08;
+
+    if (tag === 'button') return 'button-element';
+    if (role === 'button') return 'role-button';
+    if (/follow-?btn|follow-?button|note-detail-follow-btn/i.test(label)) return 'follow-control';
+    if (UI_CONTROL_RE.test(label) && isSmall) return 'small-ui-control';
+    if (SHORT_UI_TEXT_RE.test(text)) return 'short-ui-text';
+    if (/author|profile|user-?card|user-?info|user-?name|username/i.test(label) && /follow|btn|button/i.test(label)) {
+      return 'author-profile-control';
+    }
+
+    return '';
+  }
+
+  function getRootRejectReason(root, pageState, signals = null) {
+    if (!root || !(root instanceof Element)) return 'not-element';
+    if (root === rootEl || root.closest(`#${ROOT_ID}`)) return 'userscript-ui';
+    if (!isVisible(root)) return 'not-visible';
+
+    const uiReason = isNonRootUiControl(root);
+    if (uiReason) return uiReason;
+
+    const currentSignals = signals || getDetailRootSignals(root);
+    const rect = root.getBoundingClientRect();
+    const viewportArea = window.innerWidth * window.innerHeight;
+    const rootClass = classText(root).toLowerCase();
+    const hasExplicitContent = Boolean(root.querySelector('#detail-title, #detail-desc, [class*="note-content"], [class*="desc"]'));
+    const hasContentSignal = Boolean(
+      currentSignals.largeMediaCount ||
+      currentSignals.textCandidateCount ||
+      currentSignals.hasMeaningfulText ||
+      hasExplicitContent ||
+      (rect.width * rect.height > viewportArea * 0.28 && root.children.length >= 3)
+    );
+
+    if (pageState.isNoteDetailUrl && /note-detail|detail-container|detail-mask|note-container/.test(rootClass) && !hasContentSignal) {
+      return 'detail-class-without-content-signals';
+    }
+
+    if (pageState.isNoteDetailUrl && !isBroadPageContainer(root) && !hasContentSignal) {
+      return 'candidate-without-content-signals';
+    }
+
+    return '';
+  }
+
+  function isBadSection(el, options = {}) {
+    const { includeAuthor = false, includeInteraction = true } = options;
+    if (!el || !(el instanceof Element)) return false;
+
+    let node = el;
+    let depth = 0;
+    while (node && node instanceof Element && node !== document.body && node !== document.documentElement) {
+      if (node.closest?.(`#${ROOT_ID}`)) return true;
+      const label = getElementLabel(node);
+      if (BAD_SECTION_RE.test(label)) return true;
+      if (includeAuthor && depth <= 3 && /author|nickname|profile|user-?card|user-?info|user-?name|username/i.test(label)) return true;
+      if (includeInteraction && depth <= 2 && /action|interact|operation|vote/i.test(label)) return true;
+      node = node.parentElement;
+      depth += 1;
+    }
+
+    return false;
+  }
+
+  function getLargeMediaStats(root) {
+    if (!root || !(root instanceof Element || root === document)) {
+      return { count: 0, visibleCount: 0, maxArea: 0 };
+    }
+
+    const mediaNodes = [
+      ...Array.from(root.querySelectorAll('img, video')),
+      ...Array.from(root.querySelectorAll('picture source, source[type*="image"], source[srcset]')).map(getSourceSizeElement),
+      ...Array.from(root.querySelectorAll('*')).slice(0, 1200)
+        .filter(node => extractBackgroundUrls(window.getComputedStyle(node).backgroundImage).length)
+        .slice(0, 120),
+    ];
+    const seen = new Set();
+    let count = 0;
+    let visibleCount = 0;
+    let maxArea = 0;
+
+    mediaNodes.forEach(node => {
+      if (!(node instanceof Element)) return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      if (isBadSection(node, { includeAuthor: true, includeInteraction: true })) return;
+      if (!isDisplayed(node)) return;
+
+      const { rect, width, height, area } = getElementSize(node);
+      if (width < MIN_WIDTH || height < MIN_HEIGHT || area < MIN_WIDTH * MIN_HEIGHT) return;
+
+      count += 1;
+      if (isInViewport(rect)) visibleCount += 1;
+      maxArea = Math.max(maxArea, area);
+    });
+
+    return { count, visibleCount, maxArea };
+  }
+
+  function getVisibleTextCandidates(root, options = {}) {
+    const { maxCandidates = 80 } = options;
+    if (!root || !(root instanceof Element || root === document)) return [];
+
+    const candidates = [];
+    const nodes = Array.from(root.querySelectorAll('h1, h2, h3, p, div, span, section')).slice(0, 700);
+
+    nodes.forEach((node, index) => {
+      if (!(node instanceof Element)) return;
+      if (!isVisible(node)) return;
+      if (isBadSection(node, { includeAuthor: true, includeInteraction: true })) return;
+
+      const text = normalizeText(node.innerText || node.textContent, true);
+      if (!text || text.length < 8 || text.length > 10000) return;
+
+      const childText = Array.from(node.children || [])
+        .map(child => normalizeText(child.innerText || child.textContent, true))
+        .filter(Boolean);
+      if (childText.some(child => child === text && child.length > 20)) return;
+
+      const label = getElementLabel(node);
+      let score = 0;
+      if (NOTE_TEXT_RE.test(label)) score += 80;
+      if (/^h[1-3]$/i.test(node.tagName)) score += 35;
+      if (node.tagName.toLowerCase() === 'p') score += 30;
+      if (node.closest('#detail-desc, #detail-title, [class*="note-content"], [class*="desc"]')) score += 60;
+      if (text.includes('\n')) score += 15;
+      score += Math.min(text.length, 600) / 20;
+      if (node.querySelector('img, video')) score -= 40;
+      if (node.querySelectorAll('a, button').length > 4) score -= 35;
+
+      candidates.push({ node, text, score, index });
+    });
+
+    return candidates
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.index - b.index;
+      })
+      .slice(0, maxCandidates);
+  }
+
+  function getDetailRootSignals(root) {
+    if (!root || !(root instanceof Element)) {
+      return { largeMediaCount: 0, visibleLargeMediaCount: 0, maxMediaArea: 0, textCandidateCount: 0, bestTextLength: 0, meaningfulTextLength: 0, meaningfulTextPreview: '', hasMeaningfulText: false, hasAuthor: false, hasAction: false };
+    }
+
+    const now = performance.now();
+    if (now - detailSignalsCacheTime > 1200) {
+      detailSignalsCache = new WeakMap();
+      detailSignalsCacheTime = now;
+    } else if (detailSignalsCache.has(root)) {
+      return detailSignalsCache.get(root);
+    }
+
+    const mediaStats = getLargeMediaStats(root);
+    const textCandidates = getVisibleTextCandidates(root, { maxCandidates: 6 });
+    const meaningfulText = getMeaningfulTextSummary(root);
+    const label = getElementLabel(root);
+
+    const signals = {
+      largeMediaCount: mediaStats.count,
+      visibleLargeMediaCount: mediaStats.visibleCount,
+      maxMediaArea: Math.round(mediaStats.maxArea),
+      textCandidateCount: textCandidates.length,
+      bestTextLength: textCandidates[0]?.text.length || 0,
+      meaningfulTextLength: meaningfulText.length,
+      meaningfulTextPreview: meaningfulText.preview,
+      hasMeaningfulText: meaningfulText.hasMeaningfulText,
+      hasAuthor: Boolean(root.querySelector('a[href*="/user/profile"], [class*="author"], [class*="user"], [class*="profile"]')),
+      hasAction: Boolean(root.querySelector('[class*="interaction"], [class*="action"], button, [role="button"]')),
+      label,
+    };
+
+    detailSignalsCache.set(root, signals);
+    return signals;
+  }
+
+  function scoreStandaloneDetailRoot(root, pageState) {
+    if (!pageState.isNoteDetailUrl || !root || !(root instanceof Element) || root === rootEl) return -Infinity;
+    if (!isVisible(root)) return -Infinity;
+    if (root.closest(`#${ROOT_ID}`)) return -Infinity;
+
+    const rect = root.getBoundingClientRect();
+    const label = getElementLabel(root);
+    const signals = getDetailRootSignals(root);
+    if (getRootRejectReason(root, pageState, signals)) return -Infinity;
+    let score = 0;
+
+    if (!signals.largeMediaCount && !signals.textCandidateCount && !signals.hasMeaningfulText) return -Infinity;
+
+    score += Math.min(signals.largeMediaCount, 8) * 25;
+    score += Math.min(signals.visibleLargeMediaCount, 4) * 20;
+    score += Math.min(signals.bestTextLength, 500) / 8;
+    score += Math.min(signals.meaningfulTextLength || 0, 800) / 10;
+    if (signals.hasAuthor) score += 25;
+    if (signals.hasAction) score += 15;
+    if (NOTE_TEXT_RE.test(label)) score += 35;
+    if (NOTE_MEDIA_RE.test(label)) score += 20;
+    if (/detail|note/.test(label)) score += 45;
+    if (rect.width > window.innerWidth * 0.45 && rect.height > window.innerHeight * 0.35) score += 25;
+    if (isBroadPageContainer(root)) score -= 55;
+    if (BAD_TEXT_SECTION_RE.test(label)) score -= 120;
+
+    return score;
+  }
+
+  function expandStandaloneRoot(node, pageState) {
+    if (!node || !(node instanceof Element)) return null;
+
+    const candidates = [];
+    let current = node;
+    let depth = 0;
+
+    while (current && current instanceof Element && depth < 7) {
+      if (current !== document.body && current !== document.documentElement) {
+        candidates.push(current);
+      }
+      if (current.tagName?.toLowerCase() === 'main' || current.id === 'app') break;
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return candidates
+      .map(root => ({
+        root,
+        selector: getNodeSelectorHint(root),
+        score: scoreStandaloneDetailRoot(root, pageState),
+      }))
+      .filter(item => item.score > -Infinity)
+      .sort((a, b) => b.score - a.score)[0] || null;
+  }
+
+  function findStandaloneDetailRootInfo(pageState) {
+    if (!pageState.isNoteDetailUrl) return null;
+
+    const nodes = queryAllSafe(document, DETAIL_ROOT_SELECTOR);
+    const candidates = [];
+
+    nodes.forEach(node => {
+      const expanded = expandStandaloneRoot(node, pageState);
+      if (expanded) candidates.push(expanded);
+    });
+
+    const unique = uniqueElements(candidates.map(item => item.root))
+      .map(root => candidates.find(item => item.root === root))
+      .sort((a, b) => b.score - a.score);
+
+    const best = unique[0];
+    if (!best || best.score < 85) return null;
+
+    return {
+      root: best.root,
+      selector: best.selector,
+      score: best.score,
+      source: 'standalone-detail-signals',
+      pageState,
+      signals: getDetailRootSignals(best.root),
+      rejectedRootReason: '',
+    };
+  }
+
   function normalizeCandidateRoot(node, selector) {
     if (!node || !(node instanceof Element)) return null;
+    if (isNonRootUiControl(node)) return null;
 
     const detailRoot = node.closest(
       '.note-detail-mask, .note-detail-container, .note-detail, [class*="note-detail"]'
     );
+    if (isNonRootUiControl(detailRoot)) return null;
     if (detailRoot) return { root: detailRoot, selector: getNodeSelectorHint(detailRoot, selector) };
 
     const noteRoot = node.closest('.note-container, [class*="note-container"]');
+    if (isNonRootUiControl(noteRoot)) return null;
     if (noteRoot) return { root: noteRoot, selector: getNodeSelectorHint(noteRoot, selector) };
 
     const contentRoot = node.closest('[class*="media-container"], [class*="interaction-container"], [class*="note-content"]');
     if (contentRoot) {
       const parent = contentRoot.parentElement?.closest('[class*="note"], main, section, article');
       const root = parent && parent !== document.body ? parent : contentRoot;
+      if (isNonRootUiControl(root)) return null;
       return { root, selector: getNodeSelectorHint(root, selector) };
     }
 
@@ -379,6 +744,8 @@
 
     const rootClass = classText(root).toLowerCase();
     const rect = root.getBoundingClientRect();
+    const signals = getDetailRootSignals(root);
+    if (getRootRejectReason(root, pageState, signals)) return -Infinity;
     let score = 0;
 
     if (/note-detail|detail-container|detail-mask/.test(rootClass)) score += 120;
@@ -387,6 +754,10 @@
     if (hasDetailLayerIndicator(root)) score += 80;
     if (root.querySelector('#detail-title, [class*="note-content"], #detail-desc')) score += 45;
     if (root.querySelector('img, video, [style*="background"]')) score += 20;
+    if (signals.largeMediaCount && signals.textCandidateCount) score += 70;
+    if (signals.visibleLargeMediaCount) score += Math.min(signals.visibleLargeMediaCount, 3) * 15;
+    if (signals.hasMeaningfulText) score += Math.min(signals.meaningfulTextLength || 0, 800) / 10;
+    if (signals.hasAuthor) score += 15;
     if (pageState.isNoteDetailUrl) score += 40;
     if (selector.includes('note-detail')) score += 40;
     if (rect.width > window.innerWidth * 0.45 && rect.height > window.innerHeight * 0.45) score += 20;
@@ -396,33 +767,64 @@
     return score;
   }
 
+  function isStrongContentRootCandidate(item, pageState) {
+    if (!item?.root || item.score === -Infinity) return false;
+    const signals = item.signals || getDetailRootSignals(item.root);
+    if (getRootRejectReason(item.root, pageState, signals)) return false;
+    const label = getElementLabel(item.root);
+    const isNoteContainer = /note-?container|notecontainer|detail|note/.test(label);
+    if (signals.largeMediaCount && signals.textCandidateCount) return item.score >= 85;
+    if (signals.largeMediaCount && hasDetailLayerIndicator(item.root)) return item.score >= 100;
+    if (signals.textCandidateCount >= 2 && item.root.querySelector('#detail-title, #detail-desc, [class*="note-content"]')) return item.score >= 100;
+    // Share detail text roots can be valid even when images live elsewhere.
+    // 分享页文字 root 合法；图片可能在独立轮播或全局图片节点中。
+    if (pageState.isNoteDetailUrl && isNoteContainer && signals.hasMeaningfulText && (signals.hasAuthor || signals.hasAction)) return item.score >= 70;
+    return false;
+  }
+
+  function getActiveRootInfoCacheKey() {
+    return [
+      window.location.href,
+      document.body?.childElementCount || 0,
+      document.querySelector('#noteContainer') ? 'noteContainer' : '',
+    ].join('|');
+  }
+
+  function rememberActiveRootInfo(info, cacheKey) {
+    activeRootInfoCache = { key: cacheKey, value: info };
+    activeRootInfoCacheTime = performance.now();
+    return info;
+  }
+
   function findActiveNoteRootInfo() {
     const pageState = getPageState();
-    const selectors = [
-      '.note-detail-mask',
-      '.note-detail-container',
-      '.note-detail',
-      '[class*="note-detail"]',
-      '.note-container',
-      '[class*="note-container"]',
-      '[class*="media-container"]',
-      '[class*="interaction-container"]',
-      '[class*="note-content"]',
-    ];
+    const cacheKey = getActiveRootInfoCacheKey();
+    if (
+      activeRootInfoCache &&
+      activeRootInfoCache.key === cacheKey &&
+      performance.now() - activeRootInfoCacheTime < 1200
+    ) {
+      return activeRootInfoCache.value;
+    }
+
+    const selectors = ACTIVE_ROOT_SELECTORS;
 
     const candidates = [];
 
     selectors.forEach(selector => {
-      queryAllSafe(document, selector).forEach(node => {
+      queryAllSafe(document, selector).slice(0, 40).forEach(node => {
         const normalized = normalizeCandidateRoot(node, selector);
         if (!normalized?.root) return;
         if (normalized.root === rootEl || normalized.root.closest(`#${ROOT_ID}`)) return;
         if (pageState.isFeedHome && !hasDetailLayerIndicator(normalized.root)) return;
 
+        const signals = getDetailRootSignals(normalized.root);
         candidates.push({
           root: normalized.root,
           selector: normalized.selector,
           score: scoreActiveRoot(normalized.root, normalized.selector, pageState),
+          signals,
+          rejectedRootReason: getRootRejectReason(normalized.root, pageState, signals),
         });
       });
     });
@@ -432,40 +834,78 @@
       .filter(item => item.score > -Infinity)
       .sort((a, b) => b.score - a.score);
 
-    if (unique.length && unique[0].score >= 35) {
-      return {
+    const standaloneRoot = findStandaloneDetailRootInfo(pageState);
+    if (pageState.isNoteDetailUrl && standaloneRoot && !isStrongContentRootCandidate(unique[0], pageState)) {
+      return rememberActiveRootInfo(standaloneRoot, cacheKey);
+    }
+
+    if (unique.length && unique[0].score >= 35 && isStrongContentRootCandidate(unique[0], pageState)) {
+      return rememberActiveRootInfo({
         root: unique[0].root,
         selector: unique[0].selector,
         score: unique[0].score,
         source: 'candidate',
         pageState,
-      };
+        signals: unique[0].signals,
+        rejectedRootReason: '',
+      }, cacheKey);
     }
 
     // 单篇详情 URL 下允许使用较大的页面容器兜底；首页 feed 不允许兜底到全局容器。
     // On detail URLs, allow a larger page container fallback; never fall back to global containers on the feed page.
+    if (standaloneRoot) return rememberActiveRootInfo(standaloneRoot, cacheKey);
+
     if (pageState.isNoteDetailUrl) {
       const fallback = document.querySelector('main') || document.querySelector('#app') || document.body;
-      return {
+      const fallbackScore = fallback instanceof Element ? scoreStandaloneDetailRoot(fallback, pageState) : -Infinity;
+      if (fallbackScore === -Infinity) {
+        return rememberActiveRootInfo({
+          root: null,
+          selector: '',
+          score: 0,
+          source: 'detail-url-fallback-rejected',
+          pageState,
+          rejectedRootReason: 'detail-url-fallback-without-content-signals',
+        }, cacheKey);
+      }
+
+      return rememberActiveRootInfo({
         root: fallback,
         selector: getNodeSelectorHint(fallback, fallback === document.body ? 'body' : ''),
-        score: 0,
+        score: fallbackScore > -Infinity ? fallbackScore : 0,
         source: 'detail-url-fallback',
         pageState,
-      };
+        signals: fallback instanceof Element ? getDetailRootSignals(fallback) : null,
+        rejectedRootReason: '',
+      }, cacheKey);
     }
 
-    return {
+    return rememberActiveRootInfo({
       root: null,
       selector: '',
       score: 0,
       source: 'no-active-note-detail',
       pageState,
-    };
+      rejectedRootReason: '',
+    }, cacheKey);
   }
 
   function getActiveNoteRoot() {
     return findActiveNoteRootInfo().root;
+  }
+
+  function getScopedDetailRoot(root) {
+    if (!root || !(root instanceof Element)) return root;
+
+    const pageState = getPageState();
+    if (!pageState.isNoteDetailUrl || !isBroadPageContainer(root)) return root;
+
+    const standaloneRoot = findStandaloneDetailRootInfo(pageState);
+    if (standaloneRoot?.root && root.contains(standaloneRoot.root)) {
+      return standaloneRoot.root;
+    }
+
+    return root;
   }
 
   // 笔记文字采集
@@ -635,6 +1075,19 @@
       if (text) return text;
     }
 
+    const fallbackText = getVisibleTextCandidates(root, { maxCandidates: 12 })
+      .map(item => item.text)
+      .filter(text => text && text !== title && text !== time)
+      .map(text => {
+        let cleaned = text;
+        if (title) cleaned = cleaned.replace(title, '').trim();
+        if (time) cleaned = cleaned.replace(time, '').trim();
+        return cleaned;
+      })
+      .find(text => text && text.length >= 8);
+
+    if (fallbackText) return fallbackText;
+
     return '';
   }
 
@@ -701,7 +1154,7 @@
   }
 
   function collectNoteData(rootOverride = null) {
-    const root = rootOverride || getNoteRoot();
+    const root = getScopedDetailRoot(rootOverride || getNoteRoot());
     const title = getTitle(root);
     const author = getAuthor(root);
     const time = getPublishTime(root);
@@ -755,6 +1208,46 @@
     return urls;
   }
 
+  function getImageUrlAttributes(el) {
+    if (!el || !(el instanceof Element)) return [];
+    return [
+      getBestSrcFromSrcset(el.getAttribute('srcset')),
+      getBestSrcFromSrcset(el.getAttribute('data-srcset')),
+      getBestSrcFromSrcset(el.getAttribute('data-original-srcset')),
+      el.currentSrc,
+      el.src,
+      el.getAttribute('src'),
+      el.getAttribute('data-src'),
+      el.getAttribute('data-original'),
+      el.getAttribute('data-original-src'),
+      el.getAttribute('data-url'),
+      el.getAttribute('data-lazy-src'),
+      el.getAttribute('data-actualsrc'),
+      el.getAttribute('data-bg'),
+      el.getAttribute('data-background'),
+      el.getAttribute('data-background-image'),
+    ];
+  }
+
+  function getSourceSizeElement(source) {
+    if (!source || !(source instanceof Element)) return source;
+    const picture = source.closest('picture');
+    return picture?.querySelector('img') || picture || source.parentElement || source;
+  }
+
+  function getElementPath(el) {
+    if (!el || !(el instanceof Element)) return '';
+    const parts = [];
+    let node = el;
+
+    while (node && node instanceof Element && node !== document.body && parts.length < 5) {
+      parts.unshift(getNodeSelectorHint(node));
+      node = node.parentElement;
+    }
+
+    return parts.join(' > ');
+  }
+
   function getElementSize(el) {
     const rect = el.getBoundingClientRect();
 
@@ -781,8 +1274,35 @@
       lower.includes('emoji') ||
       lower.includes('logo') ||
       lower.includes('favicon') ||
-      lower.includes('sprite')
+      lower.includes('profile') ||
+      lower.includes('sprite') ||
+      lower.includes('fe-platform')
     );
+  }
+
+  // Strong URL signals let us pick note images without scanning feed images.
+  // 强 URL 信号用于识别笔记正文图，避免把 feed 或 UI 图片纳入下载。
+  function isStrongNoteImageUrl(url) {
+    const normalized = normalizeUrl(url);
+    if (!normalized) return false;
+
+    const lower = normalized.toLowerCase();
+    if (isBadImageUrl(lower)) return false;
+    if (/sns-avatar|avatar|icon|emoji|logo|favicon|profile|sprite|fe-platform/.test(lower)) return false;
+
+    return (
+      lower.includes('notes_pre_post') ||
+      /sns-webpic[^/]*\.xhscdn\.com/.test(lower) ||
+      (lower.includes('xhscdn.com') && /\/notes[^/]*\//.test(lower))
+    );
+  }
+
+  function isBlockedGlobalNoteImageElement(el) {
+    if (!el || !(el instanceof Element)) return true;
+    const blocked = el.closest(
+      '[class*="avatar"], [class*="comment"], [class*="emoji"], [class*="icon"], [class*="logo"], [class*="recommend"], [class*="related"], [class*="sidebar"], [class*="suggest"], [class*="toolbar"]'
+    );
+    return Boolean(blocked);
   }
 
   function isBadElement(el) {
@@ -792,22 +1312,16 @@
       cls.includes('avatar') ||
       cls.includes('icon') ||
       cls.includes('emoji') ||
-      cls.includes('logo')
+      cls.includes('logo') ||
+      cls.includes('recommend') ||
+      cls.includes('related') ||
+      cls.includes('sidebar') ||
+      cls.includes('suggest')
     ) {
       return true;
     }
 
-    if (
-      el.closest('[class*="avatar"]') ||
-      el.closest('[class*="comment"]') ||
-      el.closest('[class*="author"]') ||
-      el.closest('[class*="toolbar"]') ||
-      el.closest('[class*="interaction"]')
-    ) {
-      return true;
-    }
-
-    return false;
+    return isBadSection(el, { includeAuthor: true, includeInteraction: true });
   }
 
   function addCandidate(list, seen, url, el, source, visibleOnly) {
@@ -842,10 +1356,17 @@
       width: Math.round(width),
       height: Math.round(height),
       area: Math.round(area),
+      rect: {
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
       top: Math.round(rect.top + window.scrollY),
       left: Math.round(rect.left + window.scrollX),
       visible: isInViewport(rect),
       distanceToCenter,
+      elementPath: getElementPath(el),
     });
   }
 
@@ -859,18 +1380,19 @@
     const imgNodes = Array.from(scanRoot.querySelectorAll('img'));
 
     imgNodes.forEach(img => {
-      const attrs = [
-        getBestSrcFromSrcset(img.getAttribute('srcset')),
-        img.currentSrc,
-        img.src,
-        img.getAttribute('src'),
-        img.getAttribute('data-src'),
-        img.getAttribute('data-original'),
-        img.getAttribute('data-url'),
-      ];
+      const attrs = getImageUrlAttributes(img);
 
       attrs.forEach(url => {
         addCandidate(list, seen, url, img, 'img', visibleOnly);
+      });
+    });
+
+    const sourceNodes = Array.from(scanRoot.querySelectorAll('picture source, source[type*="image"], source[srcset]'));
+
+    sourceNodes.forEach(source => {
+      const sizeEl = getSourceSizeElement(source);
+      getImageUrlAttributes(source).forEach(url => {
+        addCandidate(list, seen, url, sizeEl, 'picture-source', visibleOnly);
       });
     });
 
@@ -881,10 +1403,14 @@
       addCandidate(list, seen, poster, video, 'video-poster', visibleOnly);
     });
 
-    const allNodes = Array.from(scanRoot.querySelectorAll('*'));
+    const allNodes = Array.from(scanRoot.querySelectorAll('*')).slice(0, 1600);
 
     allNodes.forEach(el => {
       if (!isDisplayed(el)) return;
+
+      getImageUrlAttributes(el).forEach(url => {
+        addCandidate(list, seen, url, el, 'lazy-attr', visibleOnly);
+      });
 
       const style = window.getComputedStyle(el);
       const bgUrls = extractBackgroundUrls(style.backgroundImage);
@@ -908,11 +1434,359 @@
     return list;
   }
 
+  function mergeImageCandidates(groups, visibleOnly) {
+    const merged = [];
+    const seen = new Set();
+
+    groups.flat().forEach(img => {
+      // Carousel clones can repeat the same image URL; download each URL once.
+      // 轮播克隆可能重复同一图片 URL；按 URL 去重，避免重复下载。
+      if (!img?.url || seen.has(img.url)) return;
+      seen.add(img.url);
+      merged.push(img);
+    });
+
+    merged.sort((a, b) => {
+      if (visibleOnly) {
+        if (b.area !== a.area) return b.area - a.area;
+        return a.distanceToCenter - b.distanceToCenter;
+      }
+
+      if (a.top !== b.top) return a.top - b.top;
+      if (a.left !== b.left) return a.left - b.left;
+      return b.area - a.area;
+    });
+
+    return merged;
+  }
+
+  function hasMediaLikeDescendant(root) {
+    if (!root || !(root instanceof Element)) return false;
+    if (root.matches?.('img, picture, video, source, [style*="background"], [data-src], [data-srcset], [data-original], [data-url]')) return true;
+    if (NOTE_MEDIA_RE.test(getElementLabel(root))) return true;
+    return Boolean(root.querySelector('img, picture, video, source, [style*="background"], [data-src], [data-srcset], [data-original], [data-url]'));
+  }
+
+  function getNearbyMediaRoots(activeRoot) {
+    const pageState = getPageState();
+    if (!pageState.isNoteDetailUrl || !activeRoot || !(activeRoot instanceof Element)) return [];
+
+    const candidates = [];
+    const add = node => {
+      if (!node || !(node instanceof Element)) return;
+      if (node === activeRoot || node === document.body || node === document.documentElement) return;
+      if (node.closest?.(`#${ROOT_ID}`)) return;
+      if (!isVisible(node)) return;
+      if (isBadSection(node, { includeAuthor: true, includeInteraction: true })) return;
+      if (!hasMediaLikeDescendant(node)) return;
+      candidates.push(node);
+    };
+
+    add(activeRoot.previousElementSibling);
+    add(activeRoot.nextElementSibling);
+
+    let parent = activeRoot.parentElement;
+    let depth = 0;
+    while (parent && parent instanceof Element && parent !== document.body && depth < 3) {
+      Array.from(parent.children || []).slice(0, 20).forEach(child => {
+        if (child !== activeRoot) add(child);
+      });
+
+      const label = getElementLabel(parent);
+      if (NOTE_MEDIA_RE.test(label) || /detail|note|container|main/.test(label)) {
+        add(parent);
+      }
+
+      parent = parent.parentElement;
+      depth += 1;
+    }
+
+    return uniqueElements(candidates).slice(0, 8);
+  }
+
+  function canUsePreviewModalImages(activeRoot = null) {
+    const pageState = getPageState();
+    if (pageState.isNoteDetailUrl) return true;
+    if (!activeRoot || !(activeRoot instanceof Element)) return false;
+
+    const rootInfo = findActiveNoteRootInfo();
+    return Boolean(rootInfo.root && rootInfo.root === activeRoot && rootInfo.pageState?.isNoteDetailUrl);
+  }
+
+  function getPreviewModalContainers() {
+    const containers = [];
+    queryAllSafe(document, '.preview-modal').forEach(node => {
+      if (isVisible(node)) containers.push(node);
+    });
+
+    queryAllSafe(document, '.preview-content, .img-wrapper').forEach(node => {
+      const modal = node.closest('.preview-modal');
+      if (modal && isVisible(modal)) containers.push(node);
+    });
+
+    queryAllSafe(document, 'img.preview-interactive').forEach(img => {
+      const modal = img.closest('.preview-modal');
+      if (modal && isVisible(modal)) containers.push(img);
+    });
+
+    return uniqueElements(containers).slice(0, 12);
+  }
+
+  function isPreviewModalImageElement(el) {
+    if (!el || !(el instanceof Element)) return false;
+    if (el.matches?.('img.preview-interactive')) return true;
+    if (el.matches?.('.preview-content img, .img-wrapper img, .preview-modal img')) return true;
+    if (el.matches?.('.preview-content picture, .img-wrapper picture, .preview-modal picture')) return true;
+    if (el.matches?.('.preview-content source, .img-wrapper source, .preview-modal source')) return true;
+    return false;
+  }
+
+  function collectPreviewModalImages(options = {}) {
+    const { visibleOnly = false, activeRoot = null } = options;
+    if (!canUsePreviewModalImages(activeRoot)) return [];
+
+    const list = [];
+    const seen = new Set();
+    const containers = getPreviewModalContainers();
+
+    containers.forEach(container => {
+      if (!isVisible(container)) return;
+
+      const nodes = [];
+      if (container.matches?.('img.preview-interactive')) {
+        nodes.push(container);
+      }
+      queryAllSafe(container, 'img.preview-interactive, .preview-content img, .img-wrapper img, picture source, source[type*="image"], source[srcset]').forEach(node => {
+        nodes.push(node);
+      });
+
+      uniqueElements(nodes).forEach(node => {
+        if (!(node instanceof Element)) return;
+        if (!isPreviewModalImageElement(node)) return;
+
+        const sizeEl = node.tagName?.toLowerCase() === 'source' ? getSourceSizeElement(node) : node;
+        const rect = sizeEl?.getBoundingClientRect?.();
+        if (!rect || rect.width < MIN_WIDTH || rect.height < MIN_HEIGHT) return;
+        if (!isDisplayed(sizeEl)) return;
+        if (visibleOnly && !isInViewport(rect)) return;
+
+        getImageUrlAttributes(node).forEach(url => {
+          addCandidate(list, seen, url, sizeEl, node.matches?.('img.preview-interactive') ? 'preview-interactive' : 'preview-modal', visibleOnly);
+        });
+      });
+    });
+
+    return mergeImageCandidates([list], visibleOnly);
+  }
+
+  // Preview modals are body-level overlays, separate from the note text root.
+  // 预览弹窗是 body 级浮层，通常不在笔记文字 root 内。
+  function addDirectPreviewCandidate(list, seen, url, img, source, visibleOnly) {
+    const normalized = normalizeUrl(url);
+    if (!normalized || seen.has(normalized)) return;
+    if (isBadImageUrl(normalized)) return;
+    if (!img || !(img instanceof Element)) return;
+
+    const modal = img.closest('.preview-modal');
+    if (!modal || !isVisible(modal) || !isDisplayed(img)) return;
+
+    const rect = img.getBoundingClientRect();
+    const width = Math.max(rect.width || 0, img.naturalWidth || 0);
+    const height = Math.max(rect.height || 0, img.naturalHeight || 0);
+    const area = width * height;
+
+    if (width < MIN_WIDTH || height < MIN_HEIGHT) return;
+    if (rect.width < MIN_WIDTH || rect.height < MIN_HEIGHT) return;
+    if (visibleOnly && !isInViewport(rect)) return;
+
+    seen.add(normalized);
+
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const screenCenterX = window.innerWidth / 2;
+    const screenCenterY = window.innerHeight / 2;
+    const distanceToCenter = Math.hypot(centerX - screenCenterX, centerY - screenCenterY);
+
+    list.push({
+      url: normalized,
+      source,
+      width: Math.round(width),
+      height: Math.round(height),
+      area: Math.round(area),
+      rect: {
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+      top: Math.round(rect.top + window.scrollY),
+      left: Math.round(rect.left + window.scrollX),
+      visible: isInViewport(rect),
+      distanceToCenter,
+      elementPath: getElementPath(img),
+    });
+  }
+
+  function collectDirectPreviewModalImages(options = {}) {
+    const { visibleOnly = false } = options;
+    const pageState = getPageState();
+    if (!pageState.isNoteDetailUrl) return [];
+
+    const list = [];
+    const seen = new Set();
+    const selectors = [
+      '.preview-modal img.preview-interactive',
+      '.preview-modal .preview-content img',
+      '.preview-modal .img-wrapper img',
+    ];
+
+    selectors.forEach(selector => {
+      queryAllSafe(document, selector).forEach(img => {
+        if (!(img instanceof HTMLImageElement)) return;
+        const modal = img.closest('.preview-modal');
+        if (!modal || !isVisible(modal)) return;
+
+        [
+          img.currentSrc,
+          img.src,
+          img.getAttribute('src'),
+        ].forEach(url => {
+          addDirectPreviewCandidate(
+            list,
+            seen,
+            url,
+            img,
+            img.matches('img.preview-interactive') ? 'direct-preview-interactive' : 'direct-preview-modal',
+            visibleOnly
+          );
+        });
+      });
+    });
+
+    return mergeImageCandidates([list], visibleOnly);
+  }
+
+  // Global note-image scanning is allowed only on concrete note detail URLs.
+  // 全局笔记图扫描只允许在单篇详情 URL 中启用，禁止用于 /explore 首页。
+  function canUseDetailUrlGlobalNoteImages(rootInfo = null) {
+    const pageState = getPageState();
+    if (!pageState.isNoteDetailUrl) return false;
+
+    const info = rootInfo || findActiveNoteRootInfo();
+    if (!info?.root || info.rejectedRootReason) return false;
+
+    const signals = info.signals || getDetailRootSignals(info.root);
+    return Boolean(
+      signals.hasMeaningfulText ||
+      signals.hasAuthor ||
+      signals.hasAction ||
+      info.root.id === 'noteContainer' ||
+      /note-container/i.test(classText(info.root))
+    );
+  }
+
+  function makeDetailUrlGlobalNoteCandidate(url, img) {
+    const normalized = normalizeUrl(url);
+    if (!isStrongNoteImageUrl(normalized)) return null;
+    if (!(img instanceof HTMLImageElement)) return null;
+    if (!isDisplayed(img)) return null;
+    if (isBlockedGlobalNoteImageElement(img)) return null;
+
+    const rect = img.getBoundingClientRect();
+    const width = Math.max(rect.width || 0, img.naturalWidth || 0);
+    const height = Math.max(rect.height || 0, img.naturalHeight || 0);
+    const area = width * height;
+
+    if (width < MIN_WIDTH || height < MIN_HEIGHT || area < MIN_WIDTH * MIN_HEIGHT) return null;
+
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const screenCenterX = window.innerWidth / 2;
+    const screenCenterY = window.innerHeight / 2;
+    const distanceToCenter = Math.hypot(centerX - screenCenterX, centerY - screenCenterY);
+
+    return {
+      url: normalized,
+      source: 'detail-url-global-note-image',
+      width: Math.round(width),
+      height: Math.round(height),
+      area: Math.round(area),
+      rect: {
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+      top: Math.round(rect.top + window.scrollY),
+      left: Math.round(rect.left + window.scrollX),
+      visible: isInViewport(rect),
+      distanceToCenter,
+      elementPath: getElementPath(img),
+    };
+  }
+
+  function collectDetailUrlGlobalNoteImages(options = {}) {
+    const { visibleOnly = false, rootInfo = null } = options;
+    // Homepage feed protection: no detail URL, no global image candidates.
+    // 首页 feed 保护：不是详情 URL 时，不返回任何全局图片候选。
+    if (!canUseDetailUrlGlobalNoteImages(rootInfo)) return [];
+
+    const rawCandidates = [];
+    queryAllSafe(document, 'img').slice(0, 300).forEach(img => {
+      getImageUrlAttributes(img).forEach(url => {
+        const candidate = makeDetailUrlGlobalNoteCandidate(url, img);
+        if (candidate) rawCandidates.push(candidate);
+      });
+    });
+
+    rawCandidates.sort((a, b) => {
+      if (a.visible !== b.visible) return a.visible ? -1 : 1;
+      if (b.area !== a.area) return b.area - a.area;
+      return a.distanceToCenter - b.distanceToCenter;
+    });
+
+    const deduped = [];
+    const seen = new Set();
+    rawCandidates.forEach(candidate => {
+      if (seen.has(candidate.url)) return;
+      seen.add(candidate.url);
+      deduped.push(candidate);
+    });
+
+    if (!visibleOnly) return deduped;
+
+    const visible = deduped.filter(candidate => candidate.visible);
+    return visible.length ? visible : deduped;
+  }
+
+  function collectNearbyImages(activeRoot, options = {}) {
+    const { visibleOnly = false } = options;
+    const roots = getNearbyMediaRoots(activeRoot);
+    return mergeImageCandidates(
+      roots.map(root => collectImagesFromRoot(root, { visibleOnly })),
+      visibleOnly
+    );
+  }
+
   function collectImages(options = {}) {
     const { visibleOnly = false, root = null } = options;
-    const activeRoot = root || getActiveNoteRoot();
+    const activeRoot = getScopedDetailRoot(root || getActiveNoteRoot());
     if (!activeRoot) return [];
-    return collectImagesFromRoot(activeRoot, { visibleOnly });
+    // Current-note image priority: preview modal, strong detail URL images, then scoped roots.
+    // 当前笔记图片优先级：预览弹窗、详情 URL 强图片、再到 root/附近媒体。
+    const directPreviewImages = collectDirectPreviewModalImages({ visibleOnly });
+    if (visibleOnly && directPreviewImages.length) return directPreviewImages;
+
+    const detailUrlGlobalImages = collectDetailUrlGlobalNoteImages({ visibleOnly });
+    if (visibleOnly && detailUrlGlobalImages.length) return detailUrlGlobalImages;
+
+    const previewImages = collectPreviewModalImages({ visibleOnly, activeRoot });
+    if (visibleOnly && previewImages.length) return previewImages;
+
+    const images = collectImagesFromRoot(activeRoot, { visibleOnly });
+    const nearbyImages = images.length ? [] : collectNearbyImages(activeRoot, { visibleOnly });
+
+    return mergeImageCandidates([directPreviewImages, detailUrlGlobalImages, images, nearbyImages, previewImages], visibleOnly);
   }
 
   function getExtFromUrl(url) {
@@ -932,12 +1806,93 @@
     return sanitizeFilePrefix(data.title || noteId || 'rednote_image');
   }
 
+  function getSafeDownloadPrefix(root = null) {
+    try {
+      return getDownloadPrefix(root || getActiveNoteRoot());
+    } catch {
+      return sanitizeFilePrefix(getNoteId() || 'rednote_image');
+    }
+  }
+
   // Probe 调试报告
   // Probe debug report
   /**
    * 生成当前页面结构调试报告
    * Build current page structure debug report
    */
+  function summarizeRootCandidate(item, index) {
+    const root = item.root;
+    const score = Number.isFinite(item.score) ? Math.round(item.score) : null;
+    return {
+      index: index + 1,
+      selector: item.selector || '',
+      source: item.source || 'candidate',
+      score,
+      rejectedRootReason: item.rejectedRootReason || '',
+      acceptedAsContentRoot: Boolean(item.acceptedAsContentRoot),
+      tagName: root?.tagName?.toLowerCase?.() || '',
+      id: root?.id || '',
+      className: root ? classText(root) : '',
+      signals: item.signals || null,
+      textPreview: root ? truncateText(normalizeText(root.innerText || root.textContent), 120) : '',
+    };
+  }
+
+  function getTopRootCandidatesForProbe(pageState) {
+    const candidates = [];
+
+    ACTIVE_ROOT_SELECTORS.forEach(selector => {
+      queryAllSafe(document, selector).slice(0, 30).forEach(node => {
+        const normalized = normalizeCandidateRoot(node, selector);
+        const root = normalized?.root || node;
+        if (!root || !(root instanceof Element)) return;
+        if (root.closest?.(`#${ROOT_ID}`)) return;
+
+        const signals = getDetailRootSignals(root);
+        const rejectedRootReason = normalized
+          ? getRootRejectReason(root, pageState, signals)
+          : (isNonRootUiControl(node) || 'normalization-rejected');
+
+        const candidate = {
+          root,
+          selector: normalized?.selector || getNodeSelectorHint(node, selector),
+          source: normalized ? 'candidate' : 'raw-rejected',
+          score: rejectedRootReason ? -Infinity : scoreActiveRoot(root, normalized?.selector || selector, pageState),
+          signals,
+          rejectedRootReason,
+        };
+        candidate.acceptedAsContentRoot = !rejectedRootReason && isStrongContentRootCandidate(candidate, pageState);
+        candidates.push(candidate);
+      });
+    });
+
+    const standaloneRoot = findStandaloneDetailRootInfo(pageState);
+    if (standaloneRoot?.root) {
+      candidates.push({
+        ...standaloneRoot,
+        rejectedRootReason: '',
+        acceptedAsContentRoot: true,
+      });
+    }
+
+    const unique = [];
+    const seen = new Set();
+    candidates.forEach(item => {
+      if (seen.has(item.root)) return;
+      seen.add(item.root);
+      unique.push(item);
+    });
+
+    return unique
+      .sort((a, b) => {
+        const aScore = Number.isFinite(a.score) ? a.score : -999999;
+        const bScore = Number.isFinite(b.score) ? b.score : -999999;
+        return bScore - aScore;
+      })
+      .slice(0, 10)
+      .map(summarizeRootCandidate);
+  }
+
   function summarizeImages(images) {
     return images.slice(0, 30).map((img, index) => ({
       index: index + 1,
@@ -945,10 +1900,22 @@
       width: img.width,
       height: img.height,
       area: img.area,
+      rect: img.rect,
       visible: img.visible,
       distanceToCenter: Math.round(img.distanceToCenter),
+      elementPath: img.elementPath,
       url: img.url,
     }));
+  }
+
+  function getDetailKind(pageState, rootInfo) {
+    if (pageState.isFeedHome && !rootInfo.root) return 'feed-home-no-detail';
+    if (rootInfo.source === 'standalone-detail-signals') return 'standalone-detail';
+    if (rootInfo.source === 'candidate' && hasDetailLayerIndicator(rootInfo.root)) return 'modal-detail';
+    if (rootInfo.source === 'candidate' && pageState.isNoteDetailUrl) return 'detail-url-candidate';
+    if (rootInfo.source === 'detail-url-fallback') return 'detail-url-fallback';
+    if (pageState.isNoteDetailUrl && !rootInfo.root) return 'detail-url-no-root';
+    return rootInfo.root ? 'unknown-detail' : 'no-detail';
   }
 
   /**
@@ -958,10 +1925,25 @@
   function buildProbeReport() {
     const rootInfo = findActiveNoteRootInfo();
     const root = rootInfo.root;
+    const scopedRoot = root ? getScopedDetailRoot(root) : null;
     const pageState = rootInfo.pageState;
-    const noteData = root ? collectNoteData(root) : { title: '', author: '' };
-    const rootImages = root ? collectImagesFromRoot(root, { visibleOnly: false }) : [];
+    const noteData = scopedRoot ? collectNoteData(scopedRoot) : { title: '', author: '' };
+    const rootImages = scopedRoot ? collectImagesFromRoot(scopedRoot, { visibleOnly: false }) : [];
+    const rootVisibleImages = scopedRoot ? collectImagesFromRoot(scopedRoot, { visibleOnly: true }) : [];
+    const nearbyImages = scopedRoot && !rootImages.length ? collectNearbyImages(scopedRoot, { visibleOnly: false }) : [];
+    const nearbyVisibleImages = scopedRoot && !rootVisibleImages.length ? collectNearbyImages(scopedRoot, { visibleOnly: true }) : [];
+    const previewImages = collectPreviewModalImages({ visibleOnly: false, activeRoot: scopedRoot });
+    const previewVisibleImages = collectPreviewModalImages({ visibleOnly: true, activeRoot: scopedRoot });
+    const directPreviewImages = collectDirectPreviewModalImages({ visibleOnly: false });
+    const directPreviewVisibleImages = collectDirectPreviewModalImages({ visibleOnly: true });
+    const detailUrlGlobalImages = collectDetailUrlGlobalNoteImages({ visibleOnly: false, rootInfo });
+    const detailUrlGlobalVisibleImages = collectDetailUrlGlobalNoteImages({ visibleOnly: true, rootInfo });
+    const collectedImages = scopedRoot ? collectImages({ root: scopedRoot, visibleOnly: false }) : [];
+    const collectedVisibleImages = scopedRoot ? collectImages({ root: scopedRoot, visibleOnly: true }) : [];
+    const previewModalCount = getPreviewModalContainers().filter(node => node.matches?.('.preview-modal')).length;
     const globalImages = collectImagesFromRoot(document, { visibleOnly: false });
+    const globalVisibleImages = collectImagesFromRoot(document, { visibleOnly: true });
+    const topRootCandidates = getTopRootCandidatesForProbe(pageState);
 
     return {
       generatedAt: new Date().toISOString(),
@@ -976,6 +1958,7 @@
         isDiscoveryItem: pageState.isDiscoveryItem,
         isNoteDetailUrl: pageState.isNoteDetailUrl,
         isNoteDetailState: Boolean(root),
+        detailKind: getDetailKind(pageState, rootInfo),
       },
       activeNoteRoot: root ? {
         selector: rootInfo.selector,
@@ -984,18 +1967,58 @@
         id: root.id || '',
         source: rootInfo.source,
         score: rootInfo.score,
-        textPreview: truncateText(normalizeText(root.innerText || root.textContent), 260),
+        signals: rootInfo.signals || getDetailRootSignals(root),
+        cameFromNoteContainer: root.id === 'noteContainer' || /note-container/i.test(classText(root)),
+        rejectedRootReason: rootInfo.rejectedRootReason || '',
+        rejectedAsUiControl: Boolean(rootInfo.rejectedRootReason),
+        acceptedAsContentRoot: !rootInfo.rejectedRootReason,
+        scopedSelector: scopedRoot ? getNodeSelectorHint(scopedRoot) : '',
+        textPreview: truncateText(normalizeText((scopedRoot || root).innerText || (scopedRoot || root).textContent), 260),
       } : {
         selector: '',
         className: '',
         source: rootInfo.source,
+        rejectedRootReason: rootInfo.rejectedRootReason || '',
         note: 'no active note detail',
       },
+      topRootCandidates,
       imageCounts: {
         documentGlobalCandidates: globalImages.length,
+        documentGlobalVisibleCandidates: globalVisibleImages.length,
         activeNoteRootCandidates: rootImages.length,
+        activeNoteRootVisibleCandidates: rootVisibleImages.length,
+        nearbyMediaCandidatesWhenRootEmpty: nearbyImages.length,
+        nearbyVisibleMediaCandidatesWhenRootEmpty: nearbyVisibleImages.length,
+        previewModalCount,
+        previewModalCandidates: previewImages.length,
+        previewModalVisibleCandidates: previewVisibleImages.length,
+        directPreviewModalCount: previewModalCount,
+        directPreviewModalCandidates: directPreviewImages.length,
+        directPreviewModalVisibleCandidates: directPreviewVisibleImages.length,
+        detailUrlGlobalNoteImageCount: detailUrlGlobalImages.length,
+        detailUrlGlobalVisibleNoteImageCount: detailUrlGlobalVisibleImages.length,
+        collectImagesCandidates: collectedImages.length,
+        collectImagesVisibleCandidates: collectedVisibleImages.length,
       },
       activeNoteRootImageCandidates: summarizeImages(rootImages),
+      activeNoteRootVisibleImageCandidates: summarizeImages(rootVisibleImages),
+      nearbyMediaImageCandidates: summarizeImages(nearbyImages),
+      nearbyVisibleMediaImageCandidates: summarizeImages(nearbyVisibleImages),
+      previewModalImageCandidates: summarizeImages(previewImages),
+      previewModalVisibleImageCandidates: summarizeImages(previewVisibleImages),
+      directPreviewModalImageCandidates: summarizeImages(directPreviewImages),
+      directPreviewModalVisibleImageCandidates: summarizeImages(directPreviewVisibleImages),
+      directPreviewModalFirstUrl: directPreviewImages[0]?.url || '',
+      userActionsUseDirectPreviewModalFirst: Boolean(directPreviewVisibleImages.length),
+      detailUrlGlobalNoteImageCandidates: summarizeImages(detailUrlGlobalImages),
+      detailUrlGlobalVisibleNoteImageCandidates: summarizeImages(detailUrlGlobalVisibleImages),
+      detailUrlGlobalFirstUrl: detailUrlGlobalImages[0]?.url || '',
+      collectImagesUsedDetailUrlGlobalNoteImage: detailUrlGlobalImages.some(img => collectedImages.some(item => item.url === img.url)),
+      userActionsUseDetailUrlGlobalNoteImage: !directPreviewVisibleImages.length && Boolean(detailUrlGlobalVisibleImages.length),
+      collectImagesUsedPreviewModal: previewImages.some(img => collectedImages.some(item => item.url === img.url)),
+      collectImagesVisibleUsedPreviewModal: previewVisibleImages.some(img => collectedVisibleImages.some(item => item.url === img.url)),
+      collectedImageCandidates: summarizeImages(collectedImages),
+      collectedVisibleImageCandidates: summarizeImages(collectedVisibleImages),
     };
   }
 
@@ -1089,6 +2112,7 @@
 
     let success = 0;
     let fail = 0;
+    const failedImages = [];
 
     for (let i = 0; i < images.length; i++) {
       const img = images[i];
@@ -1103,6 +2127,7 @@
         success++;
       } else {
         fail++;
+        failedImages.push(img);
         console.warn('[XHS Note Collector] download failed:', img.url, result.error);
       }
 
@@ -1110,8 +2135,9 @@
     }
 
     if (fail > 0) {
-      await copyLinks(images);
-      showToast(t('downloadPartial', { success, fail }), 'error');
+      const directPreviewFail = failedImages.some(img => String(img.source || '').startsWith('direct-preview'));
+      await copyLinks(failedImages.length ? failedImages : images);
+      showToast(directPreviewFail ? 'Download failed; image link copied.' : t('downloadPartial', { success, fail }), 'error');
     } else {
       showToast(t('downloadDone', { count: success }), 'success');
     }
@@ -1123,6 +2149,21 @@
     }).join('\n');
 
     await copyPlainText(text);
+  }
+
+  async function downloadDirectPreviewImage(image, prefix) {
+    const ext = getExtFromUrl(image.url);
+    const filename = `${prefix}_01.${ext}`;
+    showToast(t('downloading', { current: 1, total: 1 }));
+
+    const result = await downloadOne(image.url, filename);
+    if (result.ok) {
+      showToast(t('downloadDone', { count: 1 }), 'success');
+      return;
+    }
+
+    await copyPlainText(image.url);
+    showToast('Download failed; image link copied.', 'error');
   }
 
   function requireActiveNoteRoot() {
@@ -1161,6 +2202,18 @@
    * Download the visible large image from the current note
    */
   async function handleDownloadCurrent() {
+    const directPreviewImages = collectDirectPreviewModalImages({ visibleOnly: true });
+    if (directPreviewImages.length) {
+      await downloadDirectPreviewImage(directPreviewImages[0], getSafeDownloadPrefix());
+      return;
+    }
+
+    const detailUrlGlobalImages = collectDetailUrlGlobalNoteImages({ visibleOnly: true });
+    if (detailUrlGlobalImages.length) {
+      await downloadImages([detailUrlGlobalImages[0]], getSafeDownloadPrefix());
+      return;
+    }
+
     const rootInfo = requireActiveNoteRoot();
     if (!rootInfo) return;
 
@@ -1183,7 +2236,11 @@
     const rootInfo = requireActiveNoteRoot();
     if (!rootInfo) return;
 
-    const images = collectImages({ root: rootInfo.root, visibleOnly: false });
+    const images = mergeImageCandidates([
+      collectDirectPreviewModalImages({ visibleOnly: false }),
+      collectDetailUrlGlobalNoteImages({ visibleOnly: false, rootInfo }),
+      collectImages({ root: rootInfo.root, visibleOnly: false }),
+    ], false);
 
     if (!images.length) {
       showToast(t('noImageAll'), 'error');
@@ -1202,7 +2259,11 @@
     const rootInfo = requireActiveNoteRoot();
     if (!rootInfo) return;
 
-    const images = collectImages({ root: rootInfo.root, visibleOnly: false });
+    const images = mergeImageCandidates([
+      collectDirectPreviewModalImages({ visibleOnly: false }),
+      collectDetailUrlGlobalNoteImages({ visibleOnly: false, rootInfo }),
+      collectImages({ root: rootInfo.root, visibleOnly: false }),
+    ], false);
 
     if (!images.length) {
       showToast(t('noImageLinks'), 'error');

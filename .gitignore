@@ -1,6 +1,16 @@
 outputs/
+temp/
+debug/
 *.log
 *.tmp
 *.bak
+*.local
+node_modules/
+.env
+.env.*
+*.probe.json
+probe*.json
+pasted*.txt
+粘贴的文本*.txt
 Thumbs.db
 .DS_Store
