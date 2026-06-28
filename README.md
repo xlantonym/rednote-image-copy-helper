@@ -1,4 +1,4 @@
-小红书图片下载与复制助手 / RedNote Image Copy Helper
+# 小红书图片下载与复制助手 / RedNote Image Copy Helper
 
 [English](./README.md) | [中文](./README.zh-CN.md)
 
